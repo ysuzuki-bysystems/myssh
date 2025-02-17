@@ -1,21 +1,19 @@
-//go:build windows
+//go:build windows && amd64
 
 package tty
 
 import (
 	"context"
-	"encoding/binary"
 	"io"
 	"log"
 	"os"
 	"sync"
-	"unicode/utf16"
-	"unicode/utf8"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/term"
 	"golang.org/x/text/transform"
+	"golang.org/x/text/encoding/unicode"
+	syswin "github.com/ysuzuki-bysystems/myssh/tty/sys/windows"
 )
 
 type termState struct {
@@ -71,116 +69,6 @@ func termRestore(stdinfd, stdoutfd int, state *termState) error {
 	return nil
 }
 
-type inputRecordReader struct {
-	buf 		[1024]inputRecord
-	remaining 	[]inputRecord
-	sigwinchCh 	chan interface{}
-}
-
-func (p *inputRecordReader) Read(b []byte) (int, error) {
-	remaining := p.remaining
-	if remaining == nil {
-		// TODO WaitForSingleObjectEx ??
-		// OpenSSH (Windows) https://github.com/PowerShell/openssh-portable/blob/8fe096c7b7c7c51afd1d18654ec652187e85921b/contrib/win32/win32compat/tncon.c#L95-L104
-		// WezTerm too.
-
-		// TODO Closed??
-		nr, err := readConsoleInput(os.Stdin.Fd(), p.buf[:])
-		if err != nil {
-			return 0, err
-		}
-
-		remaining = p.buf[:nr]
-	}
-
-	var n int
-	var pos int
-	loop: for _, rec := range remaining {
-		pos++
-
-		switch rec.eventType {
-		case keyEvent:
-			kr := (*keyEventRecord)(unsafe.Pointer(&rec.event))
-			// REF https://github.com/PowerShell/openssh-portable/blob/8fe096c7b7c7c51afd1d18654ec652187e85921b/contrib/win32/win32compat/tncon.c#L168-L178
-			if !((kr.keyDown != 0 || kr.virtualKeyCode == vkMenu) &&
-				(kr.unicodeChar != 0 || kr.virtualScanCode == 0)) {
-				continue
-			}
-
-			if len(b) < 2 {
-				pos-- // Unread
-				break loop
-			}
-
-			binary.NativeEndian.PutUint16(b[n:], uint16(kr.unicodeChar))
-			n += 2
-
-		case windowBufferSizeEvent:
-			if p.sigwinchCh == nil {
-				continue
-			}
-
-			p.sigwinchCh <- nil
-
-		default:
-		}
-	}
-
-	remaining = remaining[pos:]
-	if len(remaining) < 1 {
-		p.remaining = nil
-	} else {
-		p.remaining = remaining
-	}
-
-	return n, nil
-}
-
-type w16ToUtf8Transformer struct {
-	// Pending high surrogate. 0 is not set.
-	high rune
-}
-
-func (t *w16ToUtf8Transformer) Reset() {
-	t.high = 0
-}
-
-func (t *w16ToUtf8Transformer) Transform(dst, src []byte, atEOF bool) (int, int, error) {
-	if len(src) == 0 && atEOF {
-		return 0, 0, io.EOF
-	}
-
-	high := t.high
-	var ndst, nsrc int
-
-	for i := range len(src) / 2 {
-		nsrc += 2
-
-		v := binary.NativeEndian.Uint16(src[i*2:])
-		c := rune(v)
-
-		if high != 0 {
-			c = utf16.DecodeRune(high, c)
-		}
-
-		if utf16.IsSurrogate(c) {
-			high = c
-			continue
-		}
-
-		if utf8.RuneLen(c) > len(dst) - ndst {
-			nsrc -= 2 // Unread
-			break
-		}
-
-		ndst += utf8.EncodeRune(dst[ndst:], c)
-		high = 0
-	}
-
-	t.high = high
-	return ndst, nsrc, nil
-}
-
 type tty struct {
 	cancel     context.CancelFunc
 	wg         *sync.WaitGroup
@@ -205,7 +93,8 @@ func openTty(sigwinchCh chan interface{}) (*tty, error) {
 		}
 	})
 
-	stdin := transform.NewReader(&inputRecordReader{ sigwinchCh: sigwinchCh }, &w16ToUtf8Transformer{})
+	order := unicode.LittleEndian // amd64 only
+	stdin := transform.NewReader(syswin.NewReader(sigwinchCh), unicode.UTF16(order, unicode.IgnoreBOM).NewDecoder())
 
 	return &tty{
 		cancel:     cancel,
