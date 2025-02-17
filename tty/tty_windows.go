@@ -4,59 +4,19 @@ package tty
 
 import (
 	"context"
+	"encoding/binary"
+	"io"
 	"log"
 	"os"
 	"sync"
-	"syscall"
 	"unicode/utf16"
 	"unicode/utf8"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/term"
+	"golang.org/x/text/transform"
 )
-
-var kernel32 = syscall.NewLazyDLL("kernel32.dll")
-
-var (
-	procReadConsoleInput = kernel32.NewProc("ReadConsoleInputW")
-)
-
-const (
-	keyEvent              = 0x1
-	windowBufferSizeEvent = 0x4
-
-	vkMenu = 0x12
-)
-
-type wchar uint16
-type dword uint32
-type word uint16
-
-type inputRecord struct {
-	eventType word
-	_         [2]byte
-	event     [16]byte
-}
-
-type keyEventRecord struct {
-	keyDown         int32
-	repeatCount     word
-	virtualKeyCode  word
-	virtualScanCode word
-	unicodeChar     wchar
-	controlKeyState dword
-}
-
-// REF https://github.com/elves/elvish/blob/master/pkg/sys/ewindows/console.go
-func readConsoleInput(h uintptr, buf []inputRecord) (int, error) {
-	var nr uintptr
-	r, _, err := procReadConsoleInput.Call(h, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), uintptr(unsafe.Pointer(&nr)))
-	if r != 0 {
-		err = nil
-	}
-	return int(nr), err
-}
 
 type termState struct {
 	stin  uint32
@@ -111,13 +71,120 @@ func termRestore(stdinfd, stdoutfd int, state *termState) error {
 	return nil
 }
 
+type inputRecordReader struct {
+	buf 		[1024]inputRecord
+	remaining 	[]inputRecord
+	sigwinchCh 	chan interface{}
+}
+
+func (p *inputRecordReader) Read(b []byte) (int, error) {
+	remaining := p.remaining
+	if remaining == nil {
+		// TODO WaitForSingleObjectEx ??
+		// OpenSSH (Windows) https://github.com/PowerShell/openssh-portable/blob/8fe096c7b7c7c51afd1d18654ec652187e85921b/contrib/win32/win32compat/tncon.c#L95-L104
+		// WezTerm too.
+
+		// TODO Closed??
+		nr, err := readConsoleInput(os.Stdin.Fd(), p.buf[:])
+		if err != nil {
+			return 0, err
+		}
+
+		remaining = p.buf[:nr]
+	}
+
+	var n int
+	var pos int
+	loop: for _, rec := range remaining {
+		pos++
+
+		switch rec.eventType {
+		case keyEvent:
+			kr := (*keyEventRecord)(unsafe.Pointer(&rec.event))
+			// REF https://github.com/PowerShell/openssh-portable/blob/8fe096c7b7c7c51afd1d18654ec652187e85921b/contrib/win32/win32compat/tncon.c#L168-L178
+			if !((kr.keyDown != 0 || kr.virtualKeyCode == vkMenu) &&
+				(kr.unicodeChar != 0 || kr.virtualScanCode == 0)) {
+				continue
+			}
+
+			if len(b) < 2 {
+				pos-- // Unread
+				break loop
+			}
+
+			binary.NativeEndian.PutUint16(b[n:], uint16(kr.unicodeChar))
+			n += 2
+
+		case windowBufferSizeEvent:
+			if p.sigwinchCh == nil {
+				continue
+			}
+
+			p.sigwinchCh <- nil
+
+		default:
+		}
+	}
+
+	remaining = remaining[pos:]
+	if len(remaining) < 1 {
+		p.remaining = nil
+	} else {
+		p.remaining = remaining
+	}
+
+	return n, nil
+}
+
+type w16ToUtf8Transformer struct {
+	// Pending high surrogate. 0 is not set.
+	high rune
+}
+
+func (t *w16ToUtf8Transformer) Reset() {
+	t.high = 0
+}
+
+func (t *w16ToUtf8Transformer) Transform(dst, src []byte, atEOF bool) (int, int, error) {
+	if len(src) == 0 && atEOF {
+		return 0, 0, io.EOF
+	}
+
+	high := t.high
+	var ndst, nsrc int
+
+	for i := range len(src) / 2 {
+		nsrc += 2
+
+		v := binary.NativeEndian.Uint16(src[i*2:])
+		c := rune(v)
+
+		if high != 0 {
+			c = utf16.DecodeRune(high, c)
+		}
+
+		if utf16.IsSurrogate(c) {
+			high = c
+			continue
+		}
+
+		if utf8.RuneLen(c) > len(dst) - ndst {
+			nsrc -= 2 // Unread
+			break
+		}
+
+		ndst += utf8.EncodeRune(dst[ndst:], c)
+		high = 0
+	}
+
+	t.high = high
+	return ndst, nsrc, nil
+}
+
 type tty struct {
 	cancel     context.CancelFunc
 	wg         *sync.WaitGroup
-	sigwinchCh chan interface{}
-
-	rem      []byte
-	fragment rune
+	stdin      io.Reader
 }
 
 func openTty(sigwinchCh chan interface{}) (*tty, error) {
@@ -138,10 +205,12 @@ func openTty(sigwinchCh chan interface{}) (*tty, error) {
 		}
 	})
 
+	stdin := transform.NewReader(&inputRecordReader{ sigwinchCh: sigwinchCh }, &w16ToUtf8Transformer{})
+
 	return &tty{
 		cancel:     cancel,
 		wg:         wg,
-		sigwinchCh: sigwinchCh,
+		stdin:      stdin,
 	}, nil
 }
 
@@ -153,71 +222,7 @@ func (t *tty) close() error {
 }
 
 func (t *tty) read(p []byte) (int, error) {
-	var buf []byte
-
-	if t.rem != nil {
-		buf = t.rem
-	} else {
-		// TODO WaitForSingleObjectEx
-		// OpenSSH (Windows) https://github.com/PowerShell/openssh-portable/blob/8fe096c7b7c7c51afd1d18654ec652187e85921b/contrib/win32/win32compat/tncon.c#L95-L104
-		// WezTerm too.
-
-		fragment := t.fragment
-
-		// https://github.com/microsoft/terminal/blob/8b78be5f4ae40f720d980ed41075cd11e9eb0814/samples/ReadConsoleInputStream/ReadConsoleInputStream.cs#L67
-
-		var recs [1024]inputRecord
-
-		nr, err := readConsoleInput(os.Stdin.Fd(), recs[:])
-		if err != nil {
-			return 0, err
-		}
-
-		buf = make([]byte, 0)
-		for _, rec := range recs[:nr] {
-			switch rec.eventType {
-			case keyEvent:
-				kr := (*keyEventRecord)(unsafe.Pointer(&rec.event))
-				// REF https://github.com/PowerShell/openssh-portable/blob/8fe096c7b7c7c51afd1d18654ec652187e85921b/contrib/win32/win32compat/tncon.c#L168-L178
-				if !((kr.keyDown != 0 || kr.virtualKeyCode == vkMenu) &&
-					(kr.unicodeChar != 0 || kr.virtualScanCode == 0)) {
-					continue
-				}
-
-				r := rune(kr.unicodeChar)
-				if utf16.IsSurrogate(fragment) {
-					r = utf16.DecodeRune(fragment, r)
-					fragment = 0
-				}
-
-				if utf16.IsSurrogate(r) {
-					fragment = r
-				} else {
-					buf = utf8.AppendRune(buf, r)
-					fragment = 0
-				}
-
-			case windowBufferSizeEvent:
-				t.sigwinchCh <- nil
-
-			default:
-			}
-		}
-
-		t.fragment = fragment
-	}
-
-	n := min(len(p), len(buf))
-	copy(p[:n], buf[:n])
-
-	rem := buf[n:]
-	if len(rem) > 0 {
-		t.rem = rem
-	} else {
-		t.rem = nil
-	}
-
-	return n, nil
+	return t.stdin.Read(p)
 }
 
 func (t *tty) write(p []byte) (int, error) {
